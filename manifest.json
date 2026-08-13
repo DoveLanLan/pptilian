@@ -1,0 +1,27 @@
+﻿{
+    "created_at":  "2026-08-11T19:48:26.0967262+08:00",
+    "source_project":  "C:\\Users\\16218\\session-link-gen-sessionpool-final-500-20260628-204811\\session-link-gen-sessionpool-final-500-momo-restored-20260730-1350",
+    "source_project_untouched":  true,
+    "bundle_scope":  "payment_link_tool_only_no_services_directory",
+    "excluded":  [
+                     "services",
+                     "webui data/secrets/logs/cache/venv"
+                 ],
+    "copied_files":  [
+                         "app.py",
+                         "core.py",
+                         "gpt_account_plan.py",
+                         "upi_high_success.py",
+                         "pix_standalone_extract.py",
+                         "sentinel.py",
+                         "sentinel_quickjs.py",
+                         "openai_sentinel_quickjs.js",
+                         "http_client.py",
+                         "config.py",
+                         "requirements.txt",
+                         "start.ps1",
+                         "start.bat",
+                         "templates\\index.html",
+                         "static\\js\\sff_core.js"
+                     ]
+}
