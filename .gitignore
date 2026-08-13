@@ -1,0 +1,31 @@
+# Python caches and test output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environments and configuration
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Runtime state, local data, and generated output
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+logs/
+log/
+stats/
+*.stats
+data/
+run-output/
+backups/
+instance/
+
+# Operating-system metadata
+.DS_Store
