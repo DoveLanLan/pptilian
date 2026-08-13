@@ -6,6 +6,12 @@ C:\Users\16218\session-link-gen-sessionpool-final-500-20260628-204811\session-li
 
 说明：这是根据原项目复制出来的新源码包；原项目副本本身未被回写或改动。当前独立源码包额外加入了启动时展示的“小脑虎 GPT 技术交流群”二维码弹窗、二维码静态资源与对应页面契约测试。
 
+## 交流群
+
+扫码加入小脑虎 GPT 技术交流群：
+
+![小脑虎 GPT 技术交流群二维码](static/images/startup-community-qr.png)
+
 包含范围：
 - 提链工具后端入口：app.py 中 /api/payment-modes、/api/generate-link、并发任务/日志相关逻辑
 - 提链核心：core.py 中 PAYMENT_MODES、generate_payment_link、各支付/PayPal全球轮转/OAICS/cs_live 分支
