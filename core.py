@@ -8142,6 +8142,12 @@ def generate_opll_paypal_long_link(access_token: str, country: str, currency: st
     }
     base_locale = str(payment_locale or opll_payment_locale_for_country(requested_country)).strip() or "en"
     provider_proxy_url = str(provider_proxy_url or proxy_url or "").strip()
+    # BR residential gateways commonly allow Stripe/PayPal while resetting
+    # chatgpt.com.  app.py can therefore route ChatGPT through FRONT_PROXY and
+    # the provider through BR directly.  Keep approve on the same ChatGPT route
+    # as checkout so the provider gateway is never asked to CONNECT to ChatGPT.
+    approval_proxy_url = proxy_url if requested_country == "BR" and force_country \
+        else provider_proxy_url
     combo_order = [(requested_country, requested_country)] if force_country \
         else opll_combo_attempt_order(requested_country)
     success_hint = "PayPal 页面/登录/BA approve 链" if loose_paypal_result \
@@ -8183,7 +8189,7 @@ def generate_opll_paypal_long_link(access_token: str, country: str, currency: st
             _emit_payment_stage(progress_callback, "chatgpt_approve", "ChatGPT approve / 等待授权", 5)
             stripe_redirect_url = opll_redirect_url_after_confirm(
                 access_token, stripe, confirm_payload, checkout["cs_id"], stripe_pk,
-                ctx, checkout, provider_proxy_url, payment_locale=attempt_locale,
+                ctx, checkout, approval_proxy_url, payment_locale=attempt_locale,
                 chatgpt_cookie=chatgpt_cookie)
             if accept_pm_redirect_result and opll_is_pm_redirect_url(stripe_redirect_url):
                 _emit_payment_stage(progress_callback, "done", "已提取 pm-redirects 真链", 7)

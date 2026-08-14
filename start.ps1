@@ -28,7 +28,14 @@ if ($env:CHECK_ONLY -eq '1') {
 }
 
 if (-not $env:PORT) { $env:PORT = '5000' }
+if (-not $env:FRONT_PROXY) { $env:FRONT_PROXY = 'socks5://127.0.0.1:10808' }
+if (-not (Test-Path (Join-Path $PWD 'gost.exe')) -and -not (Test-Path (Join-Path $PWD 'bin\gost.exe'))) {
+    Write-Host
+    Write-Host '  提示: 未找到 gost.exe。勾选"使用 GOST"或使用前置代理时提链会用到它。' -ForegroundColor Yellow
+    Write-Host '  请下载 gost v2 放到本目录或 bin\ 目录: https://github.com/ginuerzh/gost/releases/tag/v2.12.0' -ForegroundColor Yellow
+}
 Write-Host
+Write-Host "前置代理: $env:FRONT_PROXY"
 Write-Host "Service ready at http://127.0.0.1:$env:PORT"
 Write-Host 'Keep this window open while using the app.'
 Write-Host

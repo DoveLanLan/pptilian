@@ -182,6 +182,10 @@ body[data-theme="dark"] #sb{background:var(--red);border-color:var(--red);color:
 .proxy-test-item.ok{border-color:var(--green)}.proxy-test-item.err{border-color:var(--red)}
 .proxy-test-top{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin-bottom:5px}
 .proxy-test-meta{font-size:12px;color:var(--muted);line-height:1.45;word-break:break-word}
+.proxy-error-detail{margin-top:8px;border-top:1px dashed var(--border);padding-top:7px}
+.proxy-error-detail summary{cursor:pointer;color:var(--strong);font-size:12px;font-weight:700}
+.proxy-error-detail pre{max-height:220px;overflow:auto;margin:7px 0;padding:8px;border-radius:6px;background:var(--panel);color:var(--red);font:11px/1.45 "Cascadia Code","Fira Code",Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.proxy-error-copy{border:1px solid var(--border);background:var(--field);color:var(--strong);border-radius:5px;padding:4px 8px;cursor:pointer;font-size:11px}
 
 .gptreg-grid{display:grid;grid-template-columns:minmax(320px,.9fr) minmax(360px,1.1fr);gap:12px;align-items:start}
 .gptreg-log{height:260px;overflow:auto;background:#000;color:#fff;border:1px solid var(--border);border-radius:12px;padding:12px;font-family:"Cascadia Code","Fira Code",Consolas,monospace;font-size:12px;line-height:1.45;white-space:pre-wrap}
@@ -2173,11 +2177,14 @@ function renderSuccess(d){
 function renderProxyTestItem(item){
   var status=item.ok?'可用':'不可用';
   var top='#'+E(item.index)+' | '+E(status)+' | '+E(item.latency_seconds)+' 秒';
+  var route=item.route_mode==='paypal_br_split'?' · PayPal BR 分路由':(item.route_mode==='smart_fallback'?' · 国家代理优先 / OpenAI自动回退':'');
   var meta=item.ok
     ? '出口: '+E(item.ip||'-')+' · '+E(item.country||'-')+' '+E(item.city||'')+' · '+E(item.org||'-')+' · ChatGPT HTTP '+E(item.chatgpt_status||'-')
     : '错误: '+E(item.error||'未知错误');
-  if(item.ok)meta='ChatGPT HTTP '+E(item.chatgpt_status||'-')+' · Stripe HTTP '+E(item.stripe_status||'-')+' · IP: '+E(item.ip||'-')+' '+E(item.country||'')+' '+E(item.city||'')+' '+E(item.org||'')+(item.ipinfo_error?' · IP检测被规则拦截，不影响核心检测':'');
-  return '<div class="proxy-test-item '+(item.ok?'ok':'err')+'"><div class="proxy-test-top"><span>'+top+'</span><span>'+E(item.proxy_used||'')+'</span></div><div class="proxy-test-meta">'+meta+'</div></div>';
+  if(item.ok)meta='ChatGPT HTTP '+E(item.chatgpt_status||'-')+' · Stripe HTTP '+E(item.stripe_status||'-')+(item.paypal_status?' · PayPal HTTP '+E(item.paypal_status):'')+route+' · IP: '+E(item.ip||'-')+' '+E(item.country||'')+' '+E(item.city||'')+' '+E(item.org||'')+(item.ipinfo_error?' · IP检测被规则拦截，不影响核心检测':'');
+  var errorId='proxy-error-'+String(item.index);
+  var detail=item.ok?'':'<details class="proxy-error-detail" open><summary>查看完整错误</summary><pre id="'+errorId+'">'+E(item.error_detail||item.error||'未知错误')+'</pre><button type="button" class="proxy-error-copy" onclick="cpy(G(\''+errorId+'\').textContent)">复制完整错误</button></details>';
+  return '<div class="proxy-test-item '+(item.ok?'ok':'err')+'"><div class="proxy-test-top"><span>'+top+'</span><span>'+E(item.proxy_used||'')+'</span></div><div class="proxy-test-meta">'+meta+'</div>'+detail+'</div>';
 }
 async function testProxyPool(kind){
   kind=kind||'checkout';
@@ -2195,7 +2202,7 @@ async function testProxyPool(kind){
   rc.className='res show';
   rx.innerHTML='<div class="res-title">'+title+'</div><div style="color:var(--muted)"><span class="spin"></span> 正在检测所有代理，请稍等...</div>';
   try{
-    var r=await api('/api/proxy-pool-test',{payment_proxy_pool:pool,gost_bridge:(isNoCardUsMode()||isTeamCodexLowMode()||isPaypalGlobalMode())?false:G('gbg').checked});
+    var r=await api('/api/proxy-pool-test',{payment_proxy_pool:pool,payment_mode:currentMode(),gost_bridge:(isNoCardUsMode()||isTeamCodexLowMode()||isPaypalGlobalMode())?false:G('gbg').checked});
     var d=await r.json();
     if(!d.ok)throw new Error(d.error||'检测失败');
     rc.className='res show '+(d.bad_count?'err':'ok');

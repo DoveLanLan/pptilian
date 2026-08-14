@@ -343,7 +343,7 @@ def _token_for_worker(access_tokens: list[str], worker_id: int) -> str:
 
 
 def _normalize_payment_proxy(value: str) -> str:
-    return normalize_proxy_url(value, default_scheme="socks5h")
+    return normalize_proxy_url(value, default_scheme="http")
 
 
 def _pick_proxy(pool: list[str], default_scheme: str = "http") -> str:
@@ -376,6 +376,11 @@ def _is_paypal_mode(mode_name: str) -> bool:
 def _is_paypal_us_mode(mode_name: str) -> bool:
     text = str(mode_name or "").strip().lower()
     return text.startswith("paypal") and "us/usd" in text
+
+
+def _is_paypal_br_mode(mode_name: str) -> bool:
+    text = str(mode_name or "").strip().lower()
+    return text.startswith("paypal") and "br/brl" in text
 
 
 def _is_true_no_card_us_mode(mode_name: str) -> bool:
@@ -738,25 +743,125 @@ def _gost_forward_url(proxy_url: str) -> str:
     return text
 
 
+def _front_proxy_config() -> str:
+    """前置代理（可选）。
+
+    代理池里的落地 IP 无法直连、必须先经本地前置 SOCKS 代理中转时，
+    通过环境变量 FRONT_PROXY 配置，例如 socks5://127.0.0.1:10808。
+    配置后，池内选中的落地代理会走 GOST 两跳链路：
+      本地 -> 前置代理 -> 落地代理 -> 目标站
+    未配置时返回空串，保持原有单跳/直连行为。
+    """
+    # 前置代理是单一入口，习惯上是 SOCKS（如 Clash 的 10808）。即使用户
+    # 显式写 socks5://，HTTP 客户端也应使用 socks5h://，否则 ChatGPT 的 DNS
+    # 会在本机解析，可能选到前置节点不可达的地址并卡在 TLS handshake。
+    normalized = normalize_proxy_url(
+        os.environ.get("FRONT_PROXY") or "",
+        default_scheme="socks5h",
+    )
+    if normalized.startswith("socks5://"):
+        normalized = "socks5h://" + normalized[len("socks5://"):]
+    return normalized
+
+
+class SmartProxyRouter(ProxyChainServer):
+    """Route provider traffic through the country proxy with OpenAI fallback.
+
+    The country proxy remains the first choice for every destination so payment
+    eligibility keeps the expected geography.  A number of residential HTTP
+    gateways reset CONNECT requests to ChatGPT before a tunnel is established;
+    only those OpenAI-family targets fall back to FRONT_PROXY.  Stripe, PayPal
+    and local payment-provider domains never silently leave the country proxy.
+    """
+
+    OPENAI_HOST_SUFFIXES = (
+        "chatgpt.com",
+        "openai.com",
+        "oaistatic.com",
+        "oaiusercontent.com",
+    )
+
+    def __init__(self, front_proxy: str, country_proxy: str, log_callback=None):
+        super().__init__("", _normalize_payment_proxy(country_proxy), log_callback)
+        self.front_proxy = _front_proxy_config() if not front_proxy \
+            else normalize_proxy_url(front_proxy, default_scheme="socks5h")
+        if self.front_proxy.startswith("socks5://"):
+            self.front_proxy = "socks5h://" + self.front_proxy[len("socks5://"):]
+        self.fallback_count = 0
+
+    @classmethod
+    def _is_openai_target(cls, target: str) -> bool:
+        host = str(target or "").strip()
+        if host.startswith("["):
+            host = host[1:].split("]", 1)[0]
+        elif ":" in host:
+            host = host.rsplit(":", 1)[0]
+        host = host.strip(".").lower()
+        return any(host == suffix or host.endswith(f".{suffix}")
+                   for suffix in cls.OPENAI_HOST_SUFFIXES)
+
+    def _open_via_proxy(self, proxy_url: str, target: str) -> socket.socket:
+        if is_socks_proxy_url(proxy_url):
+            return self._connect_socks_to_target(proxy_url, target)
+        sock = self._connect_proxy(proxy_url)
+        try:
+            self._send_connect(sock, target, proxy_url=proxy_url)
+            return sock
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+
+    def _open_chain_to_target(self, target: str) -> socket.socket:
+        with self.lock:
+            country_proxy = self.dynamic_proxy
+        if country_proxy:
+            try:
+                return self._open_via_proxy(country_proxy, target)
+            except Exception as country_exc:
+                if not self._is_openai_target(target) or not self.front_proxy:
+                    raise
+                self.fallback_count += 1
+                self.log(
+                    f"国家代理访问 {target} 失败，切换 FRONT_PROXY: "
+                    f"{type(country_exc).__name__}: {country_exc}"
+                )
+        if self.front_proxy:
+            return self._open_via_proxy(self.front_proxy, target)
+        return super()._open_chain_to_target(target)
+
+
+def _smart_proxy_label(front_proxy: str, country_proxy: str, local_url: str = "") -> str:
+    label = (
+        f"智能路由 {mask_proxy_url(country_proxy)}"
+        f"（OpenAI失败回退 {mask_proxy_url(front_proxy)}）"
+    )
+    return f"{label} -> {mask_proxy_url(local_url)}" if local_url else label
+
+
 class GostHttpBridge:
-    def __init__(self, upstream_proxy: str):
+    def __init__(self, upstream_proxy: str, front_proxy: str = ""):
         self.upstream_proxy = _normalize_payment_proxy(upstream_proxy)
+        self.front_proxy = _normalize_payment_proxy(front_proxy or "")
         self.port = 0
         self.url = ""
         self.proc: subprocess.Popen | None = None
 
     def __enter__(self):
-        if not is_socks_proxy_url(self.upstream_proxy):
+        # 前置代理存在时一律走 GOST 两跳；否则仅在 SOCKS 落地代理上做原有单跳。
+        needs_bridge = bool(self.front_proxy) or is_socks_proxy_url(self.upstream_proxy)
+        if not needs_bridge:
             self.url = self.upstream_proxy
             return self
         gost = _find_gost_executable()
         self.port = _free_tcp_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        cmd = [
-            gost,
-            "-L", self.url,
-            "-F", _gost_forward_url(self.upstream_proxy),
-        ]
+        cmd = [gost, "-L", self.url]
+        if self.front_proxy:
+            cmd += ["-F", _gost_forward_url(self.front_proxy)]
+        cmd += ["-F", _gost_forward_url(self.upstream_proxy)]
         self.proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -838,7 +943,8 @@ def _cancelled_response(attempt: int, attempts: int, failures: list[str],
     }
 
 
-def _build_effective_proxy(local: str, proxy: str, payment_proxy: str) -> tuple[str, str]:
+def _build_effective_proxy(local: str, proxy: str, payment_proxy: str,
+                           stack: contextlib.ExitStack | None = None) -> tuple[str, str]:
     """Return (effective_url, label).
 
     payment_proxy is used directly. This lets the payment proxy pool contain
@@ -854,11 +960,20 @@ def _build_effective_proxy(local: str, proxy: str, payment_proxy: str) -> tuple[
         payment_proxy = randomize_proxy_sid(payment_proxy)
 
     if payment_proxy:
+        front = _front_proxy_config()
+        if front and stack is not None:
+            router = stack.enter_context(SmartProxyRouter(front, payment_proxy))
+            return router.url, _smart_proxy_label(front, payment_proxy, router.url)
         return payment_proxy, mask_proxy_url(payment_proxy)
 
     effective = proxy or local
     if not effective:
         return "", "直连"
+
+    front = _front_proxy_config()
+    if front and proxy and stack is not None:
+        router = stack.enter_context(SmartProxyRouter(front, proxy))
+        return router.url, _smart_proxy_label(front, proxy, router.url)
 
     try:
         with ProxyChainServer(local, proxy or "", lambda _: None) as chain:
@@ -872,11 +987,44 @@ def _build_stage_proxy(local: str, proxy: str, stage_proxy: str,
     normalized = _normalize_payment_proxy(stage_proxy)
     if normalized:
         normalized = randomize_proxy_sid(normalized)
+        front = _front_proxy_config()
+        if front:
+            router = stack.enter_context(SmartProxyRouter(front, normalized))
+            return router.url, _smart_proxy_label(front, normalized, router.url)
         if use_gost_bridge and is_socks_proxy_url(normalized):
             bridge = stack.enter_context(GostHttpBridge(normalized))
-            return bridge.url, f"{mask_proxy_url(normalized)} -> {mask_proxy_url(bridge.url)}"
+            label = f"{mask_proxy_url(normalized)} -> {mask_proxy_url(bridge.url)}"
+            return bridge.url, label
         return normalized, mask_proxy_url(normalized)
-    return _build_effective_proxy(local, proxy, "")
+    return _build_effective_proxy(local, proxy, "", stack=stack)
+
+
+def _build_paypal_br_domain_routes(payment_proxy: str, provider_proxy: str = "") \
+        -> tuple[str, str, str, str] | None:
+    """Split PayPal BR by destination when a working front proxy is configured.
+
+    Some residential BR gateways accept Stripe/PayPal CONNECT requests but reset
+    ChatGPT CONNECT requests. Chaining those gateways behind the local front proxy
+    also fails because the gateway closes the nested CONNECT. In that situation the
+    reliable route is:
+
+      ChatGPT checkout/approve -> FRONT_PROXY
+      Stripe/PayPal             -> BR gateway directly
+
+    Return ``(checkout_proxy, checkout_label, provider_proxy, provider_label)``.
+    ``None`` preserves the previous behavior when either side is unavailable.
+    """
+    front = _front_proxy_config()
+    br_proxy = _normalize_payment_proxy(provider_proxy or payment_proxy)
+    if not front or not br_proxy:
+        return None
+    br_proxy = randomize_proxy_sid(br_proxy)
+    return (
+        front,
+        f"ChatGPT {mask_proxy_url(front)}",
+        br_proxy,
+        f"Stripe/PayPal 直连 {mask_proxy_url(br_proxy)}",
+    )
 
 
 def _combined_proxy_label(checkout_label: str, provider_label: str, split_mode: bool) -> str:
@@ -1109,6 +1257,7 @@ def _generate_with_retries(access_token: str, mode_name: str, data: dict,
     provider_proxy_pool = _pool_from_text(data.get("provider_proxy_pool", "") or data.get("paypal_proxy_pool", ""))
     use_gost_bridge = _truthy(data.get("gost_bridge"))
     paypal_mode = _is_paypal_mode(mode_name)
+    paypal_br_mode = _is_paypal_br_mode(mode_name)
     split_stage_mode = _is_split_stage_mode(mode_name)
     true_no_card_us_mode = _is_true_no_card_us_mode(mode_name)
     team_codex_low_mode = _is_team_codex_low_mode(mode_name)
@@ -1153,30 +1302,30 @@ def _generate_with_retries(access_token: str, mode_name: str, data: dict,
                     _stage_entry_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                 )
             else:
-                attempt_payment_proxy = payment_proxy or _pick_proxy(payment_proxy_pool, default_scheme="socks5h")
+                attempt_payment_proxy = payment_proxy or _pick_proxy(payment_proxy_pool, default_scheme="http")
             attempt_provider_proxy = ""
             if split_stage_mode:
                 attempt_provider_proxy = _pick_stage_proxy_from_input(
                     _stage_exit_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                     excluded=promo_403_provider_blacklist if paypal_global_rotation_mode else None,
                 )
                 if _is_nl_ideal_v3_mode(mode_name) or _is_nl_ideal_v2_mode(mode_name) or _is_ba_pm_711_mode(mode_name) or kakao_v2_mode or twint_v2_mode or promptpay_v2_mode or (pix_mode and not pix_v2_mode):
                     attempt_provider_proxy = opll_normalize_vn_country_proxy(attempt_provider_proxy)
             elif paypal_mode and not paypal_global_no_discount_mode and (not paypal_strategies or worker_strategy == "jp_us_split"):
-                attempt_provider_proxy = provider_proxy or _pick_proxy(provider_proxy_pool, default_scheme="socks5h")
+                attempt_provider_proxy = provider_proxy or _pick_proxy(provider_proxy_pool, default_scheme="http")
             attempt_pix_final_proxy = ""
             if pix_mode and not pix_v2_mode:
                 attempt_pix_final_proxy = _pick_stage_proxy_from_input(
                     _stage_final_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                 )
             attempt_started = time.perf_counter()
             effective = ""
@@ -1186,19 +1335,26 @@ def _generate_with_retries(access_token: str, mode_name: str, data: dict,
 
             try:
                 with contextlib.ExitStack() as stack:
-                    effective, checkout_label = _build_stage_proxy(
-                        "" if split_stage_mode else local,
-                        attempt_proxy,
-                        attempt_payment_proxy,
-                        use_gost_bridge,
-                        stack,
-                    )
-                    provider_effective = effective
-                    provider_label = checkout_label
+                    paypal_br_routes = _build_paypal_br_domain_routes(
+                        attempt_payment_proxy or attempt_proxy,
+                        attempt_provider_proxy,
+                    ) if paypal_br_mode else None
+                    if paypal_br_routes:
+                        effective, checkout_label, provider_effective, provider_label = paypal_br_routes
+                    else:
+                        effective, checkout_label = _build_stage_proxy(
+                            "" if split_stage_mode else local,
+                            attempt_proxy,
+                            attempt_payment_proxy,
+                            use_gost_bridge,
+                            stack,
+                        )
+                        provider_effective = effective
+                        provider_label = checkout_label
                     if pix_mode:
                         provider_effective = ""
                         provider_label = "optional empty"
-                    if (paypal_mode or split_stage_mode) and attempt_provider_proxy:
+                    if not paypal_br_routes and (paypal_mode or split_stage_mode) and attempt_provider_proxy:
                         provider_effective, provider_label = _build_stage_proxy(
                             "", "", attempt_provider_proxy, use_gost_bridge, stack
                         )
@@ -1574,6 +1730,7 @@ def _run_concurrent_retry_job(job_id: str, access_tokens: list[str], mode_name: 
     provider_proxy_pool = _pool_from_text(data.get("provider_proxy_pool", "") or data.get("paypal_proxy_pool", ""))
     use_gost_bridge = _truthy(data.get("gost_bridge"))
     paypal_mode = _is_paypal_mode(mode_name)
+    paypal_br_mode = _is_paypal_br_mode(mode_name)
     split_stage_mode = _is_split_stage_mode(mode_name)
     true_no_card_us_mode = _is_true_no_card_us_mode(mode_name)
     team_codex_low_mode = _is_team_codex_low_mode(mode_name)
@@ -1628,30 +1785,30 @@ def _run_concurrent_retry_job(job_id: str, access_tokens: list[str], mode_name: 
                     _stage_entry_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                 )
             else:
-                attempt_payment_proxy = payment_proxy or _pick_proxy(payment_proxy_pool, default_scheme="socks5h")
+                attempt_payment_proxy = payment_proxy or _pick_proxy(payment_proxy_pool, default_scheme="http")
             attempt_provider_proxy = ""
             if split_stage_mode:
                 attempt_provider_proxy = _pick_stage_proxy_from_input(
                     _stage_exit_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                     excluded=promo_403_provider_blacklist if paypal_global_rotation_mode else None,
                 )
                 if _is_nl_ideal_v3_mode(mode_name) or _is_nl_ideal_v2_mode(mode_name) or _is_ba_pm_711_mode(mode_name) or kakao_v2_mode or twint_v2_mode or promptpay_v2_mode or (pix_mode and not pix_v2_mode):
                     attempt_provider_proxy = opll_normalize_vn_country_proxy(attempt_provider_proxy)
             elif paypal_mode and not paypal_global_no_discount_mode and (not paypal_strategies or worker_strategy == "jp_us_split"):
-                attempt_provider_proxy = provider_proxy or _pick_proxy(provider_proxy_pool, default_scheme="socks5h")
+                attempt_provider_proxy = provider_proxy or _pick_proxy(provider_proxy_pool, default_scheme="http")
             attempt_pix_final_proxy = ""
             if pix_mode and not pix_v2_mode:
                 attempt_pix_final_proxy = _pick_stage_proxy_from_input(
                     _stage_final_proxy_text(data, mode_name),
                     "",
                     [],
-                    default_scheme="socks5h",
+                    default_scheme="http",
                 )
             attempt_started = time.perf_counter()
             effective = ""
@@ -1660,19 +1817,26 @@ def _run_concurrent_retry_job(job_id: str, access_tokens: list[str], mode_name: 
             label = ""
             try:
                 with contextlib.ExitStack() as stack:
-                    effective, checkout_label = _build_stage_proxy(
-                        "" if split_stage_mode else local,
-                        attempt_proxy,
-                        attempt_payment_proxy,
-                        use_gost_bridge,
-                        stack,
-                    )
-                    provider_effective = effective
-                    provider_label = checkout_label
+                    paypal_br_routes = _build_paypal_br_domain_routes(
+                        attempt_payment_proxy or attempt_proxy,
+                        attempt_provider_proxy,
+                    ) if paypal_br_mode else None
+                    if paypal_br_routes:
+                        effective, checkout_label, provider_effective, provider_label = paypal_br_routes
+                    else:
+                        effective, checkout_label = _build_stage_proxy(
+                            "" if split_stage_mode else local,
+                            attempt_proxy,
+                            attempt_payment_proxy,
+                            use_gost_bridge,
+                            stack,
+                        )
+                        provider_effective = effective
+                        provider_label = checkout_label
                     if pix_mode:
                         provider_effective = ""
                         provider_label = "optional empty"
-                    if (paypal_mode or split_stage_mode) and attempt_provider_proxy:
+                    if not paypal_br_routes and (paypal_mode or split_stage_mode) and attempt_provider_proxy:
                         provider_effective, provider_label = _build_stage_proxy(
                             "", "", attempt_provider_proxy, use_gost_bridge, stack
                         )
@@ -1888,47 +2052,93 @@ def _run_concurrent_retry_job(job_id: str, access_tokens: list[str], mode_name: 
         _clear_cancel_token(job_id)
 
 
-def _test_proxy_candidate(index: int, raw_proxy: str, use_gost_bridge: bool) -> dict:
+def _test_proxy_candidate(index: int, raw_proxy: str, use_gost_bridge: bool,
+                          mode_name: str = "") -> dict:
     started = time.perf_counter()
     normalized = _normalize_payment_proxy(raw_proxy)
     label = mask_proxy_url(normalized) if normalized else "系统代理/直连"
     effective = normalized
+    chatgpt_status = 0
+    stripe_status = 0
+    paypal_status = 0
+    route_mode = "single_proxy"
+
+    def session_for(proxy_url: str) -> requests.Session:
+        session = requests.Session()
+        session.trust_env = not bool(proxy_url)
+        if proxy_url:
+            session.proxies.update({"http": proxy_url, "https": proxy_url})
+        return session
+
     try:
-        if use_gost_bridge and is_socks_proxy_url(normalized):
+        front = _front_proxy_config()
+        paypal_br_routes = _build_paypal_br_domain_routes(normalized) \
+            if _is_paypal_br_mode(mode_name) else None
+        if paypal_br_routes:
+            chatgpt_effective, chatgpt_label, provider_effective, provider_label = paypal_br_routes
+            label = _combined_proxy_label(chatgpt_label, provider_label, True)
+            effective = provider_effective
+            route_mode = "paypal_br_split"
+            bridge_context = contextlib.nullcontext(None)
+        elif front and normalized:
+            bridge_context = SmartProxyRouter(front, normalized)
+            route_mode = "smart_fallback"
+            chatgpt_effective = effective
+            provider_effective = effective
+        elif use_gost_bridge and is_socks_proxy_url(normalized):
             bridge_context = GostHttpBridge(normalized)
+            chatgpt_effective = effective
+            provider_effective = effective
         else:
             bridge_context = contextlib.nullcontext(None)
+            chatgpt_effective = effective
+            provider_effective = effective
 
         with bridge_context as bridge:
             if bridge:
                 effective = bridge.url
-                label = f"{mask_proxy_url(normalized)} -> {mask_proxy_url(effective)}"
-            session = requests.Session()
-            session.trust_env = not bool(effective)
-            if effective:
-                session.proxies.update({"http": effective, "https": effective})
-            chatgpt_status = 0
+                if route_mode == "smart_fallback":
+                    label = _smart_proxy_label(front, normalized, effective)
+                else:
+                    label = f"{mask_proxy_url(normalized)} -> {mask_proxy_url(effective)}"
+                chatgpt_effective = effective
+                provider_effective = effective
+            chatgpt_session = session_for(chatgpt_effective)
+            provider_session = chatgpt_session if provider_effective == chatgpt_effective \
+                else session_for(provider_effective)
             try:
-                cg_resp = session.get("https://chatgpt.com/cdn-cgi/trace", timeout=12)
+                cg_resp = chatgpt_session.get("https://chatgpt.com/cdn-cgi/trace", timeout=12)
                 chatgpt_status = cg_resp.status_code
                 if cg_resp.status_code >= 500:
                     raise RuntimeError(f"ChatGPT HTTP {cg_resp.status_code}")
             except Exception as exc:
                 raise RuntimeError(f"ChatGPT 连通失败: {exc}") from exc
 
-            stripe_status = 0
             try:
-                stripe_resp = session.get("https://api.stripe.com/", timeout=12)
+                stripe_resp = provider_session.get("https://api.stripe.com/", timeout=12)
                 stripe_status = stripe_resp.status_code
                 if stripe_resp.status_code >= 500:
                     raise RuntimeError(f"Stripe HTTP {stripe_resp.status_code}")
             except Exception as exc:
                 raise RuntimeError(f"Stripe connection failed: {exc}") from exc
 
+            if route_mode == "paypal_br_split":
+                try:
+                    paypal_resp = provider_session.get(
+                        "https://www.paypal.com/",
+                        timeout=12,
+                        allow_redirects=False,
+                    )
+                    paypal_status = paypal_resp.status_code
+                    if paypal_resp.status_code >= 500:
+                        raise RuntimeError(f"PayPal HTTP {paypal_resp.status_code}")
+                except Exception as exc:
+                    raise RuntimeError(f"PayPal connection failed: {exc}") from exc
+
             ip_info = {}
             ipinfo_error = ""
             try:
-                ip_resp = session.get("https://ipinfo.io/json", timeout=12)
+                ip_resp = provider_session.get("https://ipinfo.io/json", timeout=12)
                 if ip_resp.status_code >= 400:
                     raise RuntimeError(f"ipinfo HTTP {ip_resp.status_code}")
                 ip_info = ip_resp.json() or {}
@@ -1947,10 +2157,14 @@ def _test_proxy_candidate(index: int, raw_proxy: str, use_gost_bridge: bool) -> 
             "org": ip_info.get("org", ""),
             "chatgpt_status": chatgpt_status,
             "stripe_status": stripe_status,
+            "paypal_status": paypal_status,
+            "route_mode": route_mode,
             "ipinfo_error": ipinfo_error,
             "error": "",
+            "error_detail": "",
         }
     except Exception as exc:
+        error_detail = f"{type(exc).__name__}: {exc}"
         return {
             "ok": False,
             "index": index,
@@ -1961,8 +2175,12 @@ def _test_proxy_candidate(index: int, raw_proxy: str, use_gost_bridge: bool) -> 
             "country": "",
             "city": "",
             "org": "",
-            "chatgpt_status": 0,
+            "chatgpt_status": chatgpt_status,
+            "stripe_status": stripe_status,
+            "paypal_status": paypal_status,
+            "route_mode": route_mode,
             "error": str(exc),
+            "error_detail": error_detail,
         }
 
 
@@ -2770,11 +2988,12 @@ def proxy_pool_test():
     if False and not pool:
         return jsonify({"ok": False, "error": "代理池为空"}), 400
     use_gost_bridge = _truthy(data.get("gost_bridge"))
+    mode_name = str(data.get("payment_mode") or "").strip()
     workers = min(8, len(pool))
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(_test_proxy_candidate, index, proxy, use_gost_bridge)
+            executor.submit(_test_proxy_candidate, index, proxy, use_gost_bridge, mode_name)
             for index, proxy in enumerate(pool, start=1)
         ]
         for future in as_completed(futures):

@@ -13,6 +13,8 @@ ENV/
 !.env.example
 
 # Runtime state, local data, and generated output
+# 本地下载的 gost 可执行文件（由 start.sh 自动安装）
+bin/
 *.db
 *.db-*
 *.sqlite

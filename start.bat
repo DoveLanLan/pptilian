@@ -32,7 +32,16 @@ if "%CHECK_ONLY%"=="1" (
 )
 
 if "%PORT%"=="" set "PORT=5000"
+if "%FRONT_PROXY%"=="" set "FRONT_PROXY=socks5://127.0.0.1:10808"
+if not exist "gost.exe" if not exist "bin\gost.exe" (
+  echo.
+  echo    提示: 未找到 gost.exe。勾选"使用 GOST"或使用前置代理时提链会用到它。
+  echo    请下载 gost v2 放到本目录或 bin\ 目录：
+  echo    https://github.com/ginuerzh/gost/releases/tag/v2.12.0
+  echo.
+)
 echo.
+echo 前置代理: %FRONT_PROXY%
 echo Service ready at http://127.0.0.1:%PORT%
 echo Keep this window open while using the app.
 echo.
